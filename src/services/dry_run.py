@@ -13,7 +13,13 @@ from typing import TYPE_CHECKING
 
 from rich.table import Table
 
-from src.config import DOWNLOAD_HEADERS, KB, MAX_WORKERS
+from src.config import (
+    DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_READ_TIMEOUT,
+    DOWNLOAD_HEADERS,
+    KB,
+    MAX_WORKERS,
+)
 from src.crawlers.crawler_utils import get_download_info
 from src.downloaders.download_utils import detect_range_support
 from src.misc.file_utils import (
@@ -130,10 +136,19 @@ async def _resolve_item(item_page: str, context: ResolveContext) -> dict:
                 "status": "already_downloaded",
             }
 
+        connect_timeout = float(
+            getattr(context.session_info.args, "connect_timeout", DEFAULT_CONNECT_TIMEOUT)
+            or DEFAULT_CONNECT_TIMEOUT
+        )
+        read_timeout = float(
+            getattr(context.session_info.args, "read_timeout", DEFAULT_READ_TIMEOUT)
+            or DEFAULT_READ_TIMEOUT
+        )
         _, content_length = await asyncio.to_thread(
             detect_range_support,
             download_link,
             DOWNLOAD_HEADERS,
+            (connect_timeout, read_timeout),
         )
         size = content_length if content_length and content_length > 0 else None
         return {"filename": filename, "size": size, "status": "would_download"}

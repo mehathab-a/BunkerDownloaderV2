@@ -6,18 +6,17 @@ download experience.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import random
 import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import requests
-from requests import RequestException
-
-from src.config import DOWNLOAD_HEADERS
-from src.enums import CompletedReason, FailedReason, HTTPStatus, SkippedReason
-from src.misc.bunkr_utils import mark_subdomain_as_offline, subdomain_is_offline
+from src.config import DEFAULT_CONNECT_TIMEOUT, DEFAULT_READ_TIMEOUT, DOWNLOAD_HEADERS
+from src.crawlers.crawler_utils import refresh_item_download_link
+from src.enums import CompletedReason, FailedReason, SkippedReason
+from src.misc.bunkr_utils import subdomain_is_offline
 from src.misc.file_utils import (
     matches_ignore_list,
     matches_include_list,
@@ -28,8 +27,8 @@ from src.models import DownloadConfig, DownloadInfo, RetryConfig, SessionInfo
 
 from .download_utils import (
     detect_range_support,
+    save_file_with_resume,
     save_file_with_chunks,
-    save_file_with_progress,
     should_use_parallel_download,
 )
 
@@ -37,7 +36,6 @@ if TYPE_CHECKING:
     from src.managers.live_manager import LiveManager
 
 _BACKOFF_FACTOR = 1.5
-_SINGLE_CONNECTION_TIMEOUT = 5
 
 
 class MediaDownloader:
@@ -71,68 +69,90 @@ class MediaDownloader:
         """
         num_connections = getattr(self.session_info.args, "connections", 1)
         rate_limiter = self.session_info.rate_limiter
+        request_timeout = self._request_timeout()
 
         for attempt in range(self.retry_config.retries):
-            try:
-                supports_range, content_length = detect_range_support(
+            supports_range, content_length = detect_range_support(
+                self.download_info.download_link,
+                DOWNLOAD_HEADERS,
+                request_timeout,
+            )
+
+            if should_use_parallel_download(
+                content_length,
+                num_connections,
+                supports_range=supports_range,
+            ):
+                # .partN files are preserved on failure so a future attempt
+                # resumes instead of restarting.
+                failed = save_file_with_chunks(
                     self.download_info.download_link,
-                    DOWNLOAD_HEADERS,
-                )
-
-                if should_use_parallel_download(
-                    content_length,
-                    num_connections,
-                    supports_range=supports_range,
-                ):
-                    # .partN files are preserved on failure so a future attempt
-                    # resumes instead of restarting.
-                    chunked_failed = save_file_with_chunks(
-                        self.download_info.download_link,
-                        final_path,
-                        self.download_info.task,
-                        self.live_manager,
-                        DownloadConfig(
-                            content_length=content_length,
-                            num_connections=num_connections,
-                            headers=DOWNLOAD_HEADERS,
-                            rate_limiter=rate_limiter,
-                        ),
-                    )
-                    if not chunked_failed:
-                        return False
-
-                    # Persistent failure after CHUNK_MAX_RETRIES attempts.
-                    if not self._retry_with_backoff(
-                        attempt,
-                        event="Retrying chunked download",
-                    ):
-                        break
-
-                    continue
-
-                # Fallback: single-connection streaming download
-                response = requests.get(
-                    self.download_info.download_link,
-                    stream=True,
-                    headers=DOWNLOAD_HEADERS,
-                    timeout=_SINGLE_CONNECTION_TIMEOUT,
-                )
-                response.raise_for_status()
-
-            except RequestException as req_err:
-                if not self._handle_request_exception(req_err, attempt):
-                    break
-
-            else:
-                return save_file_with_progress(
-                    response,
                     final_path,
                     self.download_info.task,
                     self.live_manager,
+                    DownloadConfig(
+                        content_length=content_length,
+                        num_connections=num_connections,
+                        headers=DOWNLOAD_HEADERS,
+                        request_timeout=request_timeout,
+                        rate_limiter=rate_limiter,
+                    ),
+                )
+            else:
+                failed = save_file_with_resume(
+                    self.download_info.download_link,
+                    final_path,
+                    self.download_info.task,
+                    self.live_manager,
+                    headers=DOWNLOAD_HEADERS,
+                    request_timeout=request_timeout,
                     rate_limiter=rate_limiter,
                 )
 
+            if not failed:
+                return False
+
+            # A failed attempt is often an expired/rotated signed URL. Re-resolving the
+            # item page mints a fresh link before the next attempt.
+            if self._refresh_download_link():
+                self.live_manager.update_log(
+                    event="Refreshed media URL",
+                    details=(
+                        f"Obtained a fresh signed URL for "
+                        f"{self.download_info.filename} before retrying."
+                    ),
+                )
+
+            if not self._retry_with_backoff(attempt, event="Retrying download"):
+                break
+
         return True
+
+    def _request_timeout(self) -> tuple[float, float]:
+        """Return (connect_timeout, read_timeout) from CLI or defaults."""
+        args = self.session_info.args
+        connect_timeout = float(
+            getattr(args, "connect_timeout", DEFAULT_CONNECT_TIMEOUT)
+            or DEFAULT_CONNECT_TIMEOUT
+        )
+        read_timeout = float(
+            getattr(args, "read_timeout", DEFAULT_READ_TIMEOUT)
+            or DEFAULT_READ_TIMEOUT
+        )
+        return (connect_timeout, read_timeout)
+
+    def _refresh_download_link(self) -> bool:
+        """Refresh the signed media URL from the source item page."""
+        try:
+            refreshed_link = asyncio.run(refresh_item_download_link(self.download_info.item_url))
+        except RuntimeError:
+            return False
+
+        if refreshed_link and refreshed_link != self.download_info.download_link:
+            self.download_info.download_link = refreshed_link
+            return True
+
+        return False
 
     def download(self) -> bool:
         """Handle the download process.
@@ -168,15 +188,7 @@ class MediaDownloader:
             return False
 
         # Attempt to download the file with retries
-        try:
-            failed_download = self.attempt_download(final_path)
-
-        except requests.exceptions.ConnectionError:
-            self.live_manager.update_log(
-                event="Connection error",
-                details=f"Read timed out for {self.download_info.filename}",
-            )
-            failed_download = True
+        failed_download = self.attempt_download(final_path)
 
         # Handle failed download after retries
         if failed_download:
@@ -259,45 +271,6 @@ class MediaDownloader:
             time.sleep(delay)
             return True
 
-        return False
-
-    def _handle_request_exception(
-        self,
-        req_err: RequestException,
-        attempt: int,
-    ) -> bool:
-        """Handle exceptions during the request and manages retries."""
-        is_server_down = req_err.response is None or req_err.response.status_code in (
-            HTTPStatus.SERVER_DOWN,
-            HTTPStatus.SERVICE_UNAVAILABLE,
-        )
-
-        # Mark the subdomain as offline and exit the loop
-        if is_server_down:
-            marked_subdomain = mark_subdomain_as_offline(
-                self.session_info.bunkr_status,
-                self.download_info.download_link,
-            )
-            self.live_manager.update_log(
-                event="No response",
-                details=f"Subdomain '{marked_subdomain}' has been marked as offline.",
-            )
-            return False
-
-        if req_err.response.status_code == HTTPStatus.TOO_MANY_REQUESTS:
-            return self._retry_with_backoff(attempt, event="Retrying download")
-
-        if req_err.response.status_code == HTTPStatus.BAD_GATEWAY:
-            self.live_manager.update_log(
-                event="Server error",
-                details=f"Bad gateway for {self.download_info.filename}.",
-            )
-            # Setting retries to 1 forces an immediate failure on the next check.
-            self.retry_config.retries = 1
-            return False
-
-        # Do not retry, exit the loop
-        self.live_manager.update_log(event="Request error", details=str(req_err))
         return False
 
     def _handle_failed_download(self, *, is_final_attempt: bool) -> bool:

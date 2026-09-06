@@ -7,7 +7,6 @@ import re
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import aiohttp
 from bs4 import BeautifulSoup
 
 from src.misc.file_utils import remove_invalid_characters
@@ -102,19 +101,26 @@ async def extract_all_album_item_pages(
 
 
 async def get_item_download_link(
-    session: aiohttp.ClientSession,
     item_url: str,
     soup: BeautifulSoup | None = None,
 ) -> str | None:
     """Retrieve a signed direct download URL for a Bunkr item page."""
     if soup is None:
-        async with session.get(item_url) as response:
-            html = await response.text()
-
-        soup = BeautifulSoup(html, "html.parser")
+        soup = await fetch_page(item_url)
+        if soup is None:
+            return None
 
     # Get the signed URL
-    return await get_api_response(session, item_url, soup)
+    return await get_api_response(item_url, soup)
+
+
+async def refresh_item_download_link(item_url: str) -> str | None:
+    """Fetch an item page and resolve a fresh signed download URL."""
+    item_soup = await fetch_page(item_url)
+    if item_soup is None:
+        return None
+
+    return await get_item_download_link(item_url, soup=item_soup)
 
 
 def decrypt_cf_email(cf_email_hex: str) -> str:
@@ -155,12 +161,10 @@ async def get_download_info(
     clean_name: bool,
 ) -> tuple:
     """Gather download information (link, filename and date) for the item."""
-    async with aiohttp.ClientSession() as session:
-        item_download_link = await get_item_download_link(
-            session,
-            item_url,
-            soup=item_soup,
-        )
+    item_download_link = await get_item_download_link(
+        item_url,
+        soup=item_soup,
+    )
 
     item_date = get_item_date(item_soup)
     item_filename = get_item_filename(item_soup)

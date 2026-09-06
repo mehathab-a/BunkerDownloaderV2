@@ -2,7 +2,13 @@
 
 from argparse import ArgumentParser, Namespace
 
-from src.config import DEFAULT_CONNECTIONS, MAX_RETRIES, apply_config_file_defaults
+from src.config import (
+    DEFAULT_CONNECTIONS,
+    DEFAULT_CONNECT_TIMEOUT,
+    DEFAULT_READ_TIMEOUT,
+    MAX_RETRIES,
+    apply_config_file_defaults,
+)
 from src.version import get_version_string
 
 
@@ -113,6 +119,26 @@ def add_common_arguments(parser: ArgumentParser) -> None:
             "Path to a TOML config file providing default values for any of the above "
             "flags (default: looks for ./bunkr.toml). "
             "Explicit CLI flags always take precedence over the config file."
+        ),
+    )
+    parser.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "TCP connect timeout in seconds "
+            f"(default: {DEFAULT_CONNECT_TIMEOUT})."
+        ),
+    )
+    parser.add_argument(
+        "--read-timeout",
+        type=float,
+        default=None,
+        metavar="SECONDS",
+        help=(
+            "Read timeout for response streaming in seconds "
+            f"(default: {DEFAULT_READ_TIMEOUT})."
         ),
     )
     parser.add_argument(

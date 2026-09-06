@@ -80,6 +80,7 @@ class ChunkInfo:
 
     headers: dict[str, str]
     on_progress: callable
+    request_timeout: tuple[float, float]
     rate_limiter: RateLimiter | None = None
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ class DownloadConfig:
     content_length: int
     num_connections: int
     headers: dict[str, str]
+    request_timeout: tuple[float, float]
     rate_limiter: RateLimiter | None = None
 
 @dataclass(slots=True)

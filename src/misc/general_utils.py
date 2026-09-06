@@ -8,6 +8,7 @@ across projects.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 import platform
@@ -19,13 +20,12 @@ from http.client import RemoteDisconnected
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import requests
 from bs4 import BeautifulSoup
-from requests import Response
 
-from src.config import DOWNLOAD_HEADERS, FETCH_ERROR_MESSAGES, MIN_DISK_SPACE
+from src.config import DEFAULT_HEADERS, DOWNLOAD_HEADERS, FETCH_ERROR_MESSAGES, MIN_DISK_SPACE
 from src.enums import HTTPStatus
 
+from . import http_client
 from .url_utils import replace_domain_with_fallback
 
 if TYPE_CHECKING:
@@ -35,19 +35,32 @@ if TYPE_CHECKING:
 def validate_download_link(download_link: str) -> bool:
     """Check if a download link is accessible."""
     try:
-        response = requests.head(download_link, headers=DOWNLOAD_HEADERS, timeout=5)
+        response = http_client.head(
+            download_link,
+            headers=DOWNLOAD_HEADERS,
+            timeout=5,
+        )
 
-    except requests.RequestException:
+    except http_client.RequestError:
         return False
 
     return response.status_code != HTTPStatus.SERVER_DOWN
 
 
+def _fetch_page_blocking(url: str) -> object:
+    """Perform one impersonated page GET synchronously."""
+    return http_client.get(url, headers=DEFAULT_HEADERS, timeout=30)
+
+
 async def fetch_page(url: str, retries: int = 5) -> BeautifulSoup | None:
-    """Fetch the HTML content of a page at the given URL, with retry logic."""
+    """Fetch the HTML content of a page at the given URL, with retry logic.
+
+    Uses browser TLS impersonation (when curl_cffi is available) so pages guarded by
+    TLS-fingerprint bot detection load reliably.
+    """
     tried_fallback = False
 
-    def handle_response(response: Response) -> BeautifulSoup | None:
+    def handle_response(response: object) -> BeautifulSoup | None:
         """Process the HTTP response and handles specific status codes."""
         if response.status_code in FETCH_ERROR_MESSAGES:
             log_message = FETCH_ERROR_MESSAGES[response.status_code].format(url=url)
@@ -59,7 +72,7 @@ async def fetch_page(url: str, retries: int = 5) -> BeautifulSoup | None:
 
     for attempt in range(retries):
         try:
-            response = requests.Session().get(url, timeout=30)
+            response = await asyncio.to_thread(_fetch_page_blocking, url)
             if response.status_code == HTTPStatus.FORBIDDEN and not tried_fallback:
                 tried_fallback = True
                 url = replace_domain_with_fallback(url)
@@ -77,7 +90,7 @@ async def fetch_page(url: str, retries: int = 5) -> BeautifulSoup | None:
                 await asyncio.sleep(delay)
 
         # Catch-all for request-related errors
-        except requests.RequestException:
+        except http_client.RequestError:
             return None
 
     return None
@@ -92,7 +105,14 @@ def clear_terminal() -> None:
 
     command = commands.get(os.name)
     if command:
-        subprocess.run(command, shell=True, check=True)  # noqa: S603
+        with contextlib.suppress(OSError):
+            subprocess.run(  # noqa: S603
+                command,
+                shell=True,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
 
 def check_python_version(min_version: tuple[int, int] = (3, 11)) -> None:

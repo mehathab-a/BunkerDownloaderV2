@@ -15,9 +15,14 @@ from pathlib import PurePosixPath
 from typing import TYPE_CHECKING
 from urllib.parse import urlparse, urlunparse
 
-import aiohttp
-
-from src.config import BUNKR_API, DOWNLOAD_API, JS_VARS_COMP
+from src.config import (
+    BUNKR_API,
+    DOWNLOAD_API,
+    DOWNLOAD_API_ENDPOINTS,
+    JS_VARS_COMP,
+    SIGN_API_ENDPOINTS,
+)
+from src.misc import http_client
 
 if TYPE_CHECKING:
     from bs4 import BeautifulSoup
@@ -26,6 +31,12 @@ if TYPE_CHECKING:
 _DEFAULT_MAX_RETRIES = 3
 _DEFAULT_BASE_DELAY = 2.0
 _DEFAULT_TIMEOUT = 10
+
+
+def _candidate_endpoints(primary: str, endpoints: tuple[str, ...]) -> list[str]:
+    """Return de-duplicated endpoint candidates with primary first."""
+    ordered = [primary, *endpoints]
+    return list(dict.fromkeys(ordered))
 
 
 def unescape_js_path(value: str) -> str:
@@ -52,33 +63,48 @@ def extract_file_id(soup: BeautifulSoup) -> str | None:
     return script.get("data-file-id")
 
 
+def _blocking_request_json(
+    method: str,
+    api_url: str,
+    *,
+    json: dict[str, str] | None,
+    params: dict[str, str] | None,
+) -> dict[str, object] | None:
+    """Perform one impersonated JSON request synchronously."""
+    # Force gzip/deflate for non-landing page assets to avoid Brotli (br) responses
+    # from the download API.
+    headers = {"Accept-Encoding": "gzip, deflate"} if method.upper() == "POST" else None
+    response = http_client.request(
+        method,
+        api_url,
+        json=json,
+        params=params,
+        headers=headers,
+        timeout=_DEFAULT_TIMEOUT,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
 async def _request_json(
-    session: aiohttp.ClientSession,
     method: str,
     api_url: str,
     *,
     json: dict[str, str] | None = None,
     params: dict[str, str] | None = None,
 ) -> dict[str, object] | None:
-    # Force gzip/deflate for non-landing page assets to avoid Brotli (br) responses
-    # from the download API.
-    headers = {"Accept-Encoding": "gzip, deflate"} if method.upper() == "POST" else None
-    timeout = aiohttp.ClientTimeout(total=_DEFAULT_TIMEOUT)
-
+    """Request JSON with impersonation, retries and exponential backoff."""
     for attempt in range(1, _DEFAULT_MAX_RETRIES + 1):
         try:
-            async with session.request(
+            return await asyncio.to_thread(
+                _blocking_request_json,
                 method,
                 api_url,
                 json=json,
                 params=params,
-                headers=headers,
-                timeout=timeout,
-            ) as response:
-                response.raise_for_status()
-                return await response.json()
+            )
 
-        except (aiohttp.ClientError, asyncio.TimeoutError):
+        except (*http_client.RequestError, ValueError):
             if attempt < _DEFAULT_MAX_RETRIES:
                 delay = _DEFAULT_BASE_DELAY * (2 ** (attempt - 1))
                 await asyncio.sleep(delay)
@@ -87,7 +113,6 @@ async def _request_json(
 
 
 async def get_download_response(
-    session: aiohttp.ClientSession,
     file_id: str,
 ) -> str | None:
     """Fetch unsigned download URL for non-landing page assets.
@@ -98,29 +123,29 @@ async def get_download_response(
     of raising if all attempts fail, so the caller can skip the file gracefully without
     aborting the whole session.
     """
-    data = await _request_json(
-        session,
-        "POST",
-        DOWNLOAD_API,
-        json={"id": file_id},
-    )
-    if not data:
-        return None
+    for endpoint in _candidate_endpoints(DOWNLOAD_API, DOWNLOAD_API_ENDPOINTS):
+        data = await _request_json(
+            "POST",
+            endpoint,
+            json={"id": file_id},
+        )
+        if not data:
+            continue
 
-    # Guard against unexpected API response shapes so that a schema change raises a
-    # warning rather than an unhandled KeyError.
-    base_url = data.get("mediafiles")
-    path = data.get("path")
+        # Guard against unexpected API response shapes so that a schema change raises a
+        # warning rather than an unhandled KeyError.
+        base_url = data.get("mediafiles")
+        path = data.get("path")
+        if not base_url or not path:
+            continue
 
-    if not base_url or not path:
-        return None
+        parsed_url = urlparse(base_url)
+        return urlunparse(parsed_url._replace(path=path))
 
-    parsed_url = urlparse(base_url)
-    return urlunparse(parsed_url._replace(path=path))
+    return None
 
 
 async def get_api_response(
-    session: aiohttp.ClientSession,
     item_url: str,
     soup: BeautifulSoup | None = None,
 ) -> str | None:
@@ -142,7 +167,7 @@ async def get_api_response(
     # Only use the direct download endpoint when no JS vars are present, which
     # indicates an asset type without a standard landing page.
     file_id = extract_file_id(soup) if soup and not page_vars else None
-    unsigned_url = await get_download_response(session, file_id) if file_id else None
+    unsigned_url = await get_download_response(file_id) if file_id else None
 
     if not cdn_url and not unsigned_url:
         return None
@@ -150,21 +175,20 @@ async def get_api_response(
     media_slug = PurePosixPath(urlparse(unsigned_url or item_url).path).name
     media_path = urlparse(cdn_url).path if cdn_url else f"/storage/media/{media_slug}"
 
-    data = await _request_json(
-        session,
-        "GET",
-        BUNKR_API,
-        params={"path": media_path},
-    )
-    if not data:
-        return None
-
-    token = data.get("token")
-    expires_at = data.get("ex")
     base_url = cdn_url or unsigned_url
+    for endpoint in _candidate_endpoints(BUNKR_API, SIGN_API_ENDPOINTS):
+        data = await _request_json(
+            "GET",
+            endpoint,
+            params={"path": media_path},
+        )
+        if not data:
+            continue
 
-    if token and expires_at and base_url:
-        return f"{base_url}?token={token}&ex={expires_at}"
+        token = data.get("token")
+        expires_at = data.get("ex")
+        if token and expires_at and base_url:
+            return f"{base_url}?token={token}&ex={expires_at}"
 
     # API responded but returned no token -> return plain CDN URL.
     return cdn_url

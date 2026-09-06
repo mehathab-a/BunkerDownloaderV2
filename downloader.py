@@ -160,7 +160,7 @@ async def handle_download_process(
         live_manager=live_manager,
         retry_config=RetryConfig(),
     )
-    return media_downloader.download()
+    return await asyncio.to_thread(media_downloader.download)
 
 
 async def prepare_session(

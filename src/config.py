@@ -36,6 +36,16 @@ BUNKR_API = "https://glb-apisign.cdn.cr/sign"     # Signature API endpoint.
 DOWNLOAD_API = "https://dl.bunkr.cr/api/_001_v2"  # Download API endpoint.
 DOWNLOAD_REFERER = "https://dl.bunkrr.cr/"        # Referer used for downloads requests.
 FALLBACK_DOMAIN = "bunkr.cr"                      # Default fallback domain.
+SIGN_API_ENDPOINTS = (
+    "https://glb-apisign.cdn.cr/sign",
+    "https://glb-apisign.bunkr.ru/sign",
+)
+DOWNLOAD_API_ENDPOINTS = (
+    "https://dl.bunkr.cr/api/_001_v2",
+    "https://dl.bunkr.cr/api/_001",
+    "https://apidl.bunkr.ru/api/_001_v2",
+    "https://apidl.bunkr.ru/api/_001",
+)
 
 # ============================
 # Regex Patterns
@@ -87,6 +97,8 @@ MAX_RETRIES = 5          # The maximum number of retries for downloading a singl
 DEFAULT_CONNECTIONS = 4  # Default number of parallel connections for chunked downloads.
 CHUNK_MAX_RETRIES = 4    # Max retry attempts for a single failed chunk.
 CHUNK_BASE_DELAY = 1.5   # Base delay (seconds) for chunk retry exponential backoff.
+DEFAULT_CONNECT_TIMEOUT = 10.0  # TCP connect timeout in seconds.
+DEFAULT_READ_TIMEOUT = 60.0     # Socket read timeout in seconds.
 
 # Constants for file sizes, expressed in bytes.
 KB = 1024
@@ -165,6 +177,14 @@ _CONFIG_FIELDS: dict[str, tuple[object, object]] = {
     ),
     "connections": (
         DEFAULT_CONNECTIONS, lambda v: isinstance(v, int) and not isinstance(v, bool),
+    ),
+    "connect_timeout": (
+        DEFAULT_CONNECT_TIMEOUT,
+        lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0,
+    ),
+    "read_timeout": (
+        DEFAULT_READ_TIMEOUT,
+        lambda v: isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0,
     ),
     "rate_limit": (
         None, lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),

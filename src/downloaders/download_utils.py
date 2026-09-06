@@ -5,16 +5,13 @@ from __future__ import annotations
 import json
 import logging
 import random
+import re
 import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import TYPE_CHECKING
-
-import requests
-from requests import Response
-from requests.exceptions import ChunkedEncodingError, RequestException
 
 from src.config import (
     CHUNK_BASE_DELAY,
@@ -26,8 +23,13 @@ from src.config import (
     MIN_WORK_UNIT_SIZE,
     UNITS_PER_CONNECTION,
 )
+from src.enums import HTTPStatus
+from src.misc import http_client
 from src.misc.file_utils import append_suffix
 from src.models import ChunkInfo, DownloadConfig, DownloadPlan
+
+# Unified transient-error tuple covering both HTTP backends plus local IO issues.
+_TRANSFER_ERRORS = (*http_client.RequestError, OSError, ValueError)
 
 if TYPE_CHECKING:
     from src.managers.live_manager import LiveManager
@@ -43,52 +45,99 @@ def get_chunk_size(file_size: int) -> int:
     return DEFAULT_CHUNK_SIZE
 
 
-def save_file_with_progress(
-    response: Response,
+def _parse_total_size(content_range: str | None) -> int:
+    """Parse total size from a Content-Range header."""
+    if not content_range:
+        return -1
+
+    match = re.match(r"bytes\s+\d+-\d+/(\d+|\*)", content_range)
+    if not match:
+        return -1
+
+    total_size = match.group(1)
+    return int(total_size) if total_size.isdigit() else -1
+
+
+def save_file_with_resume(
+    url: str,
     download_path: str,
     task: int,
     live_manager: LiveManager,
+    headers: dict[str, str],
+    request_timeout: tuple[float, float],
     rate_limiter: RateLimiter | None = None,
 ) -> bool:
-    """Save the file from the response to the specified path.
+    """Stream a file to disk with best-effort resume support.
 
-    Appends a `.temp` extension while downloading. Handles network interruptions such as
-    IncompleteRead and ConnectionResetError (wrapped in ChunkedEncodingError) by marking
-    the download as incomplete.
+    Partial bytes are stored in `<name>.temp`; on a future retry the downloader resumes
+    using an HTTP Range request. If the server ignores ranges, the partial file is
+    discarded and the transfer restarts cleanly from byte 0.
 
     Returns:
         True on failure (partial file kept), False on success.
 
     """
-    file_size = int(response.headers.get("Content-Length", -1))
-    if file_size == -1:
-        logging.warning("Content length not provided in response headers.")
-
     temp_download_path = append_suffix(download_path, ".temp")
-    chunk_size = get_chunk_size(file_size)
-    total_downloaded = 0
+    resumed_bytes = temp_download_path.stat().st_size if temp_download_path.exists() else 0
+    request_headers = dict(headers)
+    if resumed_bytes > 0:
+        request_headers["Range"] = f"bytes={resumed_bytes}-"
 
     try:
-        with temp_download_path.open("wb") as file:
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                if chunk is not None:
+        with http_client.get(
+            url,
+            stream=True,
+            headers=request_headers,
+            timeout=request_timeout,
+        ) as response:
+            if response.status_code == HTTPStatus.RANGE_NOT_SATISFIABLE and resumed_bytes > 0:
+                temp_download_path.unlink(missing_ok=True)
+                return True
+
+            if response.status_code == HTTPStatus.OK and resumed_bytes > 0:
+                resumed_bytes = 0
+
+            response.raise_for_status()
+            expected_size = (
+                _parse_total_size(response.headers.get("Content-Range"))
+                if response.status_code == HTTPStatus.PARTIAL_CONTENT
+                else int(response.headers.get("Content-Length", -1))
+            )
+            if expected_size < 0 and response.status_code == HTTPStatus.PARTIAL_CONTENT:
+                partial_size = int(response.headers.get("Content-Length", -1))
+                expected_size = resumed_bytes + partial_size if partial_size > 0 else -1
+
+            open_mode = "ab" if resumed_bytes > 0 and response.status_code == HTTPStatus.PARTIAL_CONTENT else "wb"
+            chunk_size = get_chunk_size(expected_size if expected_size > 0 else DEFAULT_CHUNK_SIZE)
+            total_downloaded = resumed_bytes
+
+            with temp_download_path.open(open_mode) as file:
+                for chunk in response.iter_content(chunk_size=chunk_size):
+                    if not chunk:
+                        continue
+
                     file.write(chunk)
+                    num_bytes = len(chunk)
 
                     if rate_limiter:
-                        rate_limiter.consume(len(chunk))
+                        rate_limiter.consume(num_bytes)
 
-                    total_downloaded += len(chunk)
-                    completed = (total_downloaded / file_size) * 100
-                    live_manager.update_task(task, completed=completed)
+                    total_downloaded += num_bytes
+                    if expected_size > 0:
+                        completed = min((total_downloaded / expected_size) * 100, 100.0)
+                        live_manager.update_task(task, completed=completed)
 
-    except ChunkedEncodingError:
+    except _TRANSFER_ERRORS:
         return True
 
-    if total_downloaded == file_size:
-        shutil.move(temp_download_path, download_path)
-        return False
+    final_size = temp_download_path.stat().st_size if temp_download_path.exists() else -1
+    if expected_size > 0 and final_size != expected_size:
+        return True
+    if expected_size <= 0 and final_size <= 0:
+        return True
 
-    return True
+    shutil.move(temp_download_path, download_path)
+    return False
 
 
 # ==========================
@@ -97,18 +146,41 @@ def save_file_with_progress(
 def detect_range_support(
     url: str,
     headers: dict[str, str],
+    request_timeout: tuple[float, float],
 ) -> tuple[bool, int]:
-    """Send a HEAD request to detect Range support and retrieve the file size."""
+    """Detect byte-range support and discover content length."""
+    content_length = -1
     try:
-        response = requests.head(url, headers=headers, timeout=10)
+        response = http_client.head(url, headers=headers, timeout=request_timeout)
         response.raise_for_status()
         supports_range = response.headers.get("Accept-Ranges", "").lower() == "bytes"
         content_length = int(response.headers.get("Content-Length", -1))
+        if supports_range and content_length > 0:
+            return True, content_length
 
-    except (RequestException, ValueError):
-        return False, -1
+    except _TRANSFER_ERRORS:
+        pass
 
-    return supports_range, content_length
+    probe_headers = {**headers, "Range": "bytes=0-0"}
+    try:
+        with http_client.get(
+            url,
+            headers=probe_headers,
+            stream=True,
+            timeout=request_timeout,
+        ) as response:
+            response.raise_for_status()
+            if response.status_code == HTTPStatus.PARTIAL_CONTENT:
+                discovered = _parse_total_size(response.headers.get("Content-Range"))
+                if discovered > 0:
+                    return True, discovered
+                partial_size = int(response.headers.get("Content-Length", -1))
+                return True, partial_size
+
+    except _TRANSFER_ERRORS:
+        pass
+
+    return False, content_length
 
 
 def should_use_parallel_download(
@@ -233,11 +305,11 @@ def _attempt_chunk_once(
     written = 0
 
     try:
-        with requests.get(
+        with http_client.get(
             url,
             headers=chunk_headers,
             stream=True,
-            timeout=30,
+            timeout=chunk_info.request_timeout,
         ) as response:
             response.raise_for_status()
             with path.open("wb") as file:
@@ -255,7 +327,7 @@ def _attempt_chunk_once(
         if path.exists() and path.stat().st_size == expected:
             return False
 
-    except (RequestException, OSError):
+    except _TRANSFER_ERRORS:
         chunk_info.on_progress(-written)
         return True
 
@@ -359,6 +431,7 @@ def download_chunks(
                 ChunkInfo(
                     headers=download_config.headers,
                     on_progress=on_progress,
+                    request_timeout=download_config.request_timeout,
                     rate_limiter=download_config.rate_limiter,
                 ),
             ): path
@@ -432,5 +505,10 @@ def save_file_with_chunks(
         return True
 
     merge_chunks(chunk_paths, base_path)
+    merged_size = base_path.stat().st_size if base_path.exists() else -1
+    if merged_size != sum(expected_sizes):
+        base_path.unlink(missing_ok=True)
+        return True
+
     cleanup(chunk_paths, base_path)
     return False

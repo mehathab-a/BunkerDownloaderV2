@@ -14,6 +14,10 @@
 - Provides progress indication during downloads.
 - Automatically creates a directory structure for organized storage.
 - Logs URLs that encounter errors for troubleshooting.
+- Refreshes expiring signed media URLs automatically during retries.
+- Resumes interrupted single-stream downloads from `.temp` partial files.
+- Uses endpoint fallback for signing and media-resolution API churn.
+- Includes a provider-based `search.py` returner with exact-match filtering.
 
 ## Dependencies
 
@@ -185,6 +189,78 @@ Allowed values: 0 (don't re-download) and larger.
 
 ```bash
 python3 downloader.py <bunkr_url> --max-retries 3
+```
+
+## Network Timeouts
+
+Tune connection and read timeouts for unstable networks:
+
+```bash
+python3 downloader.py <bunkr_url> --connect-timeout 10 --read-timeout 60
+```
+
+## Search Returner
+
+`search.py` queries Bunkr-adjacent search and similar provider APIs, returning a
+normalized JSON payload while still passing provider-native params.
+
+### Basic usage
+
+```bash
+python3 search.py --provider balbums --query "test" --provider-param mode=fuzzy --provider-param sort=latest --provider-param per=20 --page 1
+python3 search.py --provider turbo --query "test" --page-size 5 --provider-param view=popular
+```
+
+`turbo` (alias for `turbo_library`) searches the official [turbo.cr](https://turbo.cr/library) public album library. Saint download resolution remains URL-only via `fetch.py` (Tier C).
+
+### Exact match modes
+
+```bash
+python3 search.py --provider gelbooru --query "cat ears" --exact-mode phrase
+python3 search.py --provider e621 --query "landscape" --exact-mode token_all
+```
+
+### Search all providers
+
+```bash
+python3 search.py --provider all --query "sunset"
+```
+
+## Search → Preview → Download Workflow
+
+For locating and retrieving content you own or have the rights to, use the
+preview-then-download workflow (view results before downloading, like an index site).
+
+1. Search and generate a viewable HTML preview plus a URL list:
+
+```bash
+python3 search.py --provider balbums --query "<your name or keyword>" \
+    --page-size 40 --provider-param mode=fuzzy --quiet \
+    --html preview.html --urls-out URLs.txt
+```
+
+2. Open `preview.html` in a browser and review the thumbnails/titles. Edit `URLs.txt`
+   to keep only the albums you want.
+
+3. Batch download the reviewed **Bunkr** URLs with the existing downloader:
+
+```bash
+python3 main.py
+```
+
+> Only download content you own or otherwise have the rights to.
+
+## Multi-host downloads (PixelDrain / GoFile / Cyberdrop / Saint)
+
+For non-Bunkr hosts, use `fetch.py` (resolves album/file URLs, then downloads with the
+same chunked/resume engine). Browser TLS impersonation via `curl_cffi` is used when
+installed.
+
+```bash
+python3 fetch.py --dry-run https://pixeldrain.com/u/<id>
+python3 fetch.py https://gofile.io/d/<code>
+python3 fetch.py https://cyberdrop.cr/a/<album_id>
+python3 fetch.py https://saint2.su/embed/<id>
 ```
 
 ## Logging
